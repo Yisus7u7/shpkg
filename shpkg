@@ -1,0 +1,648 @@
+#!/usr/bin/env bash
+# shpkg - the package manager written in bash
+
+set -e -u -o pipefail # Bash strict mode
+#set -x -v # debug
+
+# shpkg name
+# shpkg version
+# shpkg maintainer
+# shpkg package template directory
+# shpkg sources list
+# temporary directory
+SHPKG_NAME="shpkg"
+SHPKG_VERSION="1.6.2"
+SHPKG_MAINTAINER="marcusz"
+SHPKG_PKGDIRS="/data/data/com.termux/files/usr/var/shpkg/cache/files"
+SHPKG_REPOLIST="/data/data/com.termux/files/usr/etc/shpkg_repo.list"
+SHPKG_PERSIST_TMPDIR="${TMPDIR:-/tmp}/shpkg"
+
+# add colors to add glyphs to the script
+if command -v tput 1>/dev/null 2>&1; then
+    NOATTR="$(tput sgr0)"
+    BOLD="${NOATTR}$(tput bold)"
+    BRED="${BOLD}$(tput setaf 1)"
+    BGREEN="${BOLD}$(tput setaf 2)"
+else
+    NOATTR=$'\e[0m'
+    BOLD=$'\e[1;37m'
+    BRED=$'\e[1;31m'
+    BGREEN=$'\e[1;32m'
+fi
+
+# perform environment checks
+for deps in xz tar curl less; do
+    if ! command -v ${deps} >/dev/null 2>&1; then
+        echo "${BRED}Error: ${BOLD}the program '${deps}' isn't installed! please install it!${NOATTR}"
+        exit 2
+    fi
+done
+
+# check root which defines ANDROID
+if [ "$(id -u)" == "0" ]; then
+    SHPKG_SUDO=""
+else
+    if [ -e /system/bin/app_process ]; then
+        SHPKG_SUDO=""
+    else
+        SHPKG_SUDO="sudo -Es"
+    fi
+fi
+
+# checks if SHPKG_ASSUME_FORCE_YES variable is set to 1
+# this is used for non-interactive installs
+# this kind of variable will non-interactively remove packages. use with caution
+
+# set preferred distro-specific configurations
+if [ -e "${PREFIX:-/usr}/bin/apt-get" ] >/dev/null 2>&1; then
+    if [ "${SHPKG_ASSUME_FORCE_YES:-}" == "1" ]; then ASSUME_YES="--assume-yes"; fi
+    SHPKG_INSTALL="apt-get install --assume-yes"
+    SHPKG_REMOVE="apt-get purge ${ASSUME_YES:-}"
+elif [ -e "/usr/bin/pacman" ] 2>&1; then
+    if [ "${SHPKG_ASSUME_FORCE_YES:-}" == "1" ]; then ASSUME_YES="--noconfirm"; fi
+    SHPKG_INSTALL="pacman -S --noconfirm --needed"
+    SHPKG_REMOVE="pacman -R ${ASSUME_YES:-}"
+elif [ -e "/usr/bin/dnf" ]; then
+    if [ "${SHPKG_ASSUME_FORCE_YES:-}" == "1" ]; then ASSUME_YES="--assumeyes"; fi
+    SHPKG_INSTALL="dnf install --assumeyes"
+    SHPKG_REMOVE="dnf remove ${ASSUME_YES:-}"
+elif [ -e "/sbin/apk" ]; then
+    if [ "${SHPKG_ASSUME_FORCE_YES:-}" == "1" ]; then ASSUME_YES=""; else ASSUME_YES="-i"; fi
+    SHPKG_INSTALL="apk add"
+    SHPKG_REMOVE="apk del ${ASSUME_YES:-}"
+else
+    SHPKG_NO_INSTALL_DEPS=1
+fi
+
+ARG_ACTION="${1:-}"
+ARG_PACKAGE="${2:-}"
+
+# parse arguments
+case "${ARG_ACTION}" in
+install)
+    SHPKG_ACTION="shpkg-do-install"
+    ;;
+uninstall)
+    SHPKG_ACTION="shpkg-do-remove"
+    ;;
+query)
+    SHPKG_ACTION="shpkg-do-query"
+    ;;
+list)
+    SHPKG_ACTION="shpkg-do-list"
+    ;;
+update)
+    SHPKG_ACTION="shpkg-do-update"
+    ;;
+info | show)
+    SHPKG_ACTION="shpkg-show-package-info"
+    ;;
+*)
+    SHPKG_ACTION="shpkg-show-help"
+    ;;
+esac
+
+check-package-ifexists() {
+    if [ -z "${ARG_PACKAGE:-}" ]; then
+        echo "${BRED}Error: ${BOLD}please query a package!${NOATTR}"
+        exit 2
+    fi
+
+    # now check if packages directory exists
+    if [ ! -d "${SHPKG_PKGDIRS}/${ARG_PACKAGE}" ]; then
+        echo "${BRED}Error: ${BOLD}package dosen't exists in: ${SHPKG_PKGDIRS}${NOATTR}"
+        exit 2
+    fi
+
+    SHPKG_WHATISDIR="${SHPKG_PKGDIRS}/${ARG_PACKAGE}"
+}
+
+check-shpkg-build() {
+    if [ ! -e "${SHPKG_WHATISDIR}/SHPKG_BUILD" ]; then
+        echo "${BRED}Error: ${BOLD}you do not have SHPKG_BUILD file in the package directory"
+        exit 2
+    fi
+}
+
+shpkg-do-install() {
+    SRCDIR="pkgsrc"
+
+    check-package-ifexists # checks for package directory metadata
+    check-shpkg-build      # checks for SHPKG_BUILD script
+
+    # source the SHPKG_BUILD script
+    source "${SHPKG_WHATISDIR}/SHPKG_BUILD"
+
+    # package name, else fallback
+    if [ -n "${shpkg_name:-}" ]; then
+        PACKAGE_NAME="${shpkg_name[@]}"
+    else
+        PACKAGE_NAME="${ARG_PACKAGE}"
+    fi
+
+    # some packages aren't compatible with the architecture
+    # the shpkg_arch_only will facilitate that
+    if [ -n "${shpkg_arch_only:-}" ]; then
+        # multi-value variables
+        # format would be like
+        # shpkg_arch_only=(x86_64 aarch64)
+
+        for detect_arch in "${shpkg_arch_only[@]}"; do
+            case "${detect_arch}" in
+            x86_64 | amd64 | x64)
+                guess_arch="amd64"
+                ;;
+            i686 | i386 | x86)
+                guess_arch="i386"
+                ;;
+            armv7l | armv8l | armhf)
+                guess_arch="armhf"
+                ;;
+            aarch64 | arm64)
+                guess_arch="arm64"
+                ;;
+            *)
+                echo "${BRED}Error: ${BOLD}the architecture ${detect_arch} isn't supported or invalid"
+                echo
+                echo "Supported architectures: amd64, i386, armhf, arm64${NOATTR}"
+                exit 2
+                ;;
+            esac
+
+            # detect real arch
+            case "$(uname -m)" in
+            x86_64 | amd64 | x64)
+                real_arch="amd64"
+                ;;
+            i686 | i386 | x86)
+                real_arch="i386"
+                ;;
+            armv7l | armv8l | armhf)
+                real_arch="armhf"
+                ;;
+            aarch64 | arm64)
+                real_arch="arm64"
+                ;;
+            esac
+
+            # check if those arches match
+            if [ ! "${guess_arch}" == "${real_arch}" ]; then
+                NOTCOMPATIBLE=1
+            else
+                NOTCOMPATIBLE=0
+                break
+            fi
+        done
+
+        # check if it's compatible by obtaining status
+        if [ "${NOTCOMPATIBLE:-}" == "1" ]; then
+            echo "${BRED}Error: ${BOLD}the package ${PACKAGE_NAME} isn't compatible with your architecture${NOATTR}"
+            exit 2
+        fi
+    fi
+
+    # prepare install
+    echo "${BGREEN}==> ${BOLD}Target Package Installation: ${PACKAGE_NAME} (On $(date))${NOATTR}"
+    sleep 5
+
+    if [ ! -n "${SHPKG_NO_INSTALL_DEPS:-}" ]; then
+        # install build dependencies if possible
+        if [ -n "${shpkg_build_depends:-}" ]; then
+            echo "${BGREEN}==> ${BOLD}Installing build dependencies for: ${PACKAGE_NAME}${NOATTR}"
+            eval "${SHPKG_SUDO} ${SHPKG_INSTALL} ${shpkg_build_depends[@]}"
+
+            # ask for user if wanted to remove build dependencies
+            read -r -p "${BOLD}I: Remove build dependencies after install? (Y/n)${NOATTR} " yesno
+
+            case "${yesno}" in
+            Y* | y*)
+                DO_REMOVE_BUILDDEPS="y"
+                ;;
+            N* | n*)
+                DO_REMOVE_BUILDDEPS="n"
+                ;;
+            esac
+        fi
+
+        # install runtime dependencies if possible
+        if [ -n "${shpkg_depends:-}" ]; then
+            echo "${BGREEN}==> ${BOLD}Installing runtime dependencies for: ${PACKAGE_NAME}${NOATTR}"
+            eval "${SHPKG_SUDO} ${SHPKG_INSTALL} ${shpkg_depends[@]}"
+        fi
+    fi
+
+    # get source code and go to the desired directory!
+    cd "${SHPKG_WHATISDIR}"
+    rm -rf "${SRCDIR}"
+
+    if [ -n "${shpkg_source:-}" ]; then
+        # first, check if shpkg_source_use_git was given
+        if [ "${shpkg_src_use_git:-false}" == "true" ]; then
+            # check if shpkg_git_branch was specified, otherwise we could use the master branch
+            if [ -n "${shpkg_git_branch:-}" ]; then
+                GIT_BRANCH="-b ${shpkg_git_branch[@]}"
+            else
+                GIT_BRANCH="-b master"
+            fi
+
+            # check if we skip include submodules
+            if [ "${shpkg_git_skip_include_submodule:-false}" == "true" ]; then
+                SUBMODULE_INCLUDE=""
+            else
+                SUBMODULE_INCLUDE="--recursive"
+            fi
+
+            # check if shpkg_git_depth values is specified
+            if [ -n "${shpkg_git_depth:-}" ]; then
+                GIT_DEPTH="--depth=${shpkg_git_depth[@]}"
+            else
+                GIT_DEPTH=""
+            fi
+        else
+            # check if the archive was explicitly chosen into zip, by default we use tar
+            if [ "${shpkg_source_archive_zip:-false}" == "true" ]; then
+                OUTPUT_CURL="sources.zip"
+                EXTRACTOR_PARAMS="-d ${SRCDIR}"
+                # check whether to enable verbose extraction
+                if [ "${shpkg_enable_verbose_logging:-false}" == "true" ]; then
+                    EXTRACTOR_MODE="unzip"
+                else
+                    EXTRACTOR_MODE="unzip -qq"
+                fi
+            else
+                OUTPUT_CURL="sources.tar"
+                # check if shpkg_no_strip_tarball is enabled
+                # normally all source tarballs have subdirectories in it
+                if [ ! "${shpkg_no_strip_tarball:-false}" == "true" ]; then
+                    EXTRACTOR_PARAMS="-C ${SRCDIR} --strip=1"
+                else
+                    EXTRACTOR_PARAMS="-C ${SRCDIR}"
+                fi
+                # check whether to enable verbose extraction
+                if [ "${shpkg_enable_verbose_logging:-false}" == "true" ]; then
+                    EXTRACTOR_MODE="tar -xvf"
+                else
+                    EXTRACTOR_MODE="tar -xf"
+                fi
+            fi
+        fi
+
+        # get source code
+        echo "${BGREEN}==> ${BOLD}Downloading sources...${NOATTR}"
+        if [ "${shpkg_src_use_git:-false}" == "true" ]; then
+            eval "git clone ${shpkg_source[@]} ${GIT_BRANCH[@]} ${SUBMODULE_INCLUDE} ${GIT_DEPTH[@]} ${SRCDIR}"
+        else
+            curl --location --fail "${shpkg_source[@]}" --output "${OUTPUT_CURL}"
+            mkdir -p "${SRCDIR}"
+
+            # extract sources
+            echo "${BGREEN}==> ${BOLD}Extracting sources${NOATTR}"
+            eval "${EXTRACTOR_MODE} ${OUTPUT_CURL} ${EXTRACTOR_PARAMS}"
+        fi
+    fi
+
+    # check if auto-patch is disabled, if shpkg_disable_auto_patch_src is set will not apply patch automatically
+    if [ -n "${shpkg_source:-}" ] && [ ! "${shpkg_disable_auto_patch_src:-false}" == "true" ]; then
+        # patch source code if necessary
+        cd "${SRCDIR}"
+        for patches in ../*.patch; do
+            if [ -e "${patches}" ]; then
+                patch -p1 <"${patches}"
+            fi
+        done
+        cd ..
+    fi
+
+    # check for prepare() function, usually this is a prehook function before building stuff
+    if declare -t -F prepare; then
+        echo "${BGREEN}==> ${BOLD}Running pre-installation hooks...${NOATTR}"
+        prepare
+    fi
+
+    # not all packages can be compilable or probably independent, check if build() function exists
+    if ! declare -t -F build; then
+        echo "${BGREEN}==> ${BOLD}Skipping build for: ${PACKAGE_NAME}${NOATTR}"
+    else
+        echo "${BGREEN}==> ${BOLD}Starting build for: ${PACKAGE_NAME}${NOATTR}"
+        build
+    fi
+
+    # run finish function
+    if declare -t -F finish; then
+        echo "${BGREEN}==> ${BOLD}Finishing build and performing post-hook and installation of the package...${NOATTR}"
+        finish
+    fi
+
+    # remove build dependencies if possible
+    if [ "${DO_REMOVE_BUILDDEPS:-n}" == "y" ]; then
+        echo "${BGREEN}==> ${BOLD}Removing build dependencies to save space...${NOATTR}"
+        eval "${SHPKG_SUDO} ${SHPKG_REMOVE} ${shpkg_build_depends[@]}" || :
+    fi
+
+    echo "${BGREEN}==> ${BOLD}Success installing package: ${PACKAGE_NAME}${NOATTR}"
+    exit 0
+}
+
+shpkg-do-remove() {
+    check-package-ifexists # checks for package directory metadata
+    check-shpkg-build      # checks for SHPKG_BUILD script
+
+    # source the SHPKG_BUILD script
+    source "${SHPKG_WHATISDIR}/SHPKG_BUILD"
+
+    # package name, else fallback
+    if [ -n "${shpkg_name:-}" ]; then
+        PACKAGE_NAME="${shpkg_name}"
+    else
+        PACKAGE_NAME="${ARG_PACKAGE}"
+    fi
+
+    # check if the build script has uninstall function, else abort
+    if ! declare -t -F remove; then
+        echo "${BRED}Error: ${BOLD}the package ${PACKAGE_NAME} can't be removed and the build script dosen't contain remove() function${NOATTR}"
+        exit 2
+    fi
+
+    # ask for confirmation
+    read -r -p "${BOLD}Do you want to uninstall package: ${PACKAGE_NAME}? (y/N)${NOATTR} " yesno
+
+    case "${yesno}" in
+    Y* | y*)
+        echo "${BGREEN}==> ${BOLD}Uninstalling the package...${NOATTR}"
+        remove
+        ;;
+    N* | n*)
+        echo "${BGREEN}==> ${BOLD}Aborting...${NOATTR}"
+        exit 0
+        ;;
+    *)
+        echo "${BGREEN}==> ${BOLD}Aborting...${NOATTR}"
+        exit 0
+        ;;
+    esac
+
+    if [ ! -n "${SHPKG_NO_INSTALL_DEPS:-}" ]; then
+        if [ -n "${shpkg_depends:-}" ]; then
+            read -r -p "${BOLD}Do you also want to uninstall dependencies as well? (Y/n)${NOATTR} " yesno
+            case "${yesno}" in
+            Y* | y*)
+                DO_REMOVE_DEPS="y"
+                ;;
+            N* | n*)
+                DO_REMOVE_DEPS="n"
+                ;;
+            *)
+                DO_REMOVE_DEPS="y"
+                ;;
+            esac
+        fi
+
+        # remove dependencies if that's so
+        if [ "${DO_REMOVE_DEPS:-n}" == "y" ]; then
+            echo "${BGREEN}==> ${BOLD}Removing runtime dependencies to save space...${NOATTR}"
+            eval "${SHPKG_SUDO} ${SHPKG_REMOVE} ${shpkg_depends}" || :
+        fi
+    fi
+
+    echo "${BGREEN}==> ${BOLD}Removal of the package ${PACKAGE_NAME} was successful!${NOATTR}"
+    exit 0
+}
+
+shpkg-do-query() {
+    check-package-ifexists # checks for package directory metadata
+    check-shpkg-build      # checks for SHPKG_BUILD script
+
+    # if PAGER variable isn't specified, use less by default
+    if [ -n "${PAGER:-}" ]; then
+        export PAGER_METHOD="${PAGER}"
+    else
+        export PAGER_METHOD="less -N"
+    fi
+
+    # view buildscript
+    ${PAGER_METHOD} "${SHPKG_WHATISDIR}/SHPKG_BUILD"
+}
+
+shpkg-do-list() {
+    # check if SHPKG_PKGDIRS exists
+    if [ ! -d "${SHPKG_PKGDIRS}" ]; then
+        echo "${BRED}Error: ${BOLD}you don't have any package build script information in ${SHPKG_PKGDIRS}"
+        echo
+        echo "You can add package build scripts in that directory"
+        echo "without this directory, you cannot install/remove packages in this way${NOATTR}"
+        exit 2
+    fi
+
+    # check if SHPKG_PKGDIRS is empty and inform a user
+    if [ -z "$(ls "${SHPKG_PKGDIRS}")" ]; then
+        echo "${BOLD}Info: the package build script information directory is empty, try adding your package build scripts there${NOATTR}"
+        exit 0
+    fi
+
+    # list packages, (just use ls stupid, very simple way lol)
+    ls "${SHPKG_PKGDIRS}" -1
+}
+
+shpkg-show-package-info() {
+    check-package-ifexists # checks for package directory metadata
+    check-shpkg-build      # checks for SHPKG_BUILD script
+
+    # source the SHPKG_BUILD script
+    source "${SHPKG_WHATISDIR}/SHPKG_BUILD"
+
+    # package name, else fallback
+    if [ -n "${shpkg_name:-}" ]; then
+        PACKAGE_NAME="${shpkg_name[@]}"
+    else
+        PACKAGE_NAME="${ARG_PACKAGE}"
+    fi
+
+    # obtain package info
+    # name
+    nam="${PACKAGE_NAME}"
+    # description
+    if [ -n "${shpkg_description:-}" ]; then
+        desc="${shpkg_description[@]:-}"
+    else
+        desc="Not Set"
+    fi
+    # version
+    if [ -n "${shpkg_version:-}" ]; then
+        ver="${shpkg_version[@]:-}"
+    else
+        ver="Not Set"
+    fi
+    # dependencies
+    if [ -n "${shpkg_depends:-}" ]; then
+        deps="${shpkg_depends[@]:-}"
+    else
+        deps="Not set"
+    fi
+    # build depends
+    if [ -n "${shpkg_build_depends:-}" ]; then
+        builddeps="${shpkg_build_depends[@]:-}"
+    else
+        builddeps="Not Set"
+    fi
+    # source code
+    if [ -n "${shpkg_source:-}" ]; then
+        src="${shpkg_source[@]:-}"
+    else
+        src="Not Set"
+    fi
+
+    # assemble info
+    echo "${BOLD}Name:${NOATTR} ${nam}"
+    echo "${BOLD}Description:${NOATTR} ${desc}"
+    echo "${BOLD}Version:${NOATTR} ${ver}"
+    echo "${BOLD}Dependencies:${NOATTR} ${deps}"
+    echo "${BOLD}Build Dependencies:${NOATTR} ${builddeps}"
+    echo "${BOLD}Source Code:${NOATTR} ${src}"
+}
+
+shpkg-do-update() {
+    # check sources list file
+    if [ ! -e "${SHPKG_REPOLIST}" ]; then
+        echo "${BRED}Error: ${BOLD}you don't have a repository list file in ${SHPKG_REPOLIST}! please specify a repo url to fetch package buildscripts${NOATTR}"
+        exit 2
+    fi
+
+    # check if the repo list file is empty
+    if [ -z "$(cat ${SHPKG_REPOLIST})" ]; then
+        echo "${BRED}Error: ${BOLD}please specify build script url (git/tar/zip) to fetch package buildscripts!${NOATTR}"
+        exit 2
+    fi
+
+    # let's delete old cache
+    rm -rf "${SHPKG_PKGDIRS}"
+    mkdir -p "${SHPKG_PKGDIRS}"
+
+    # create tmpdir
+    mkdir -p "${SHPKG_PERSIST_TMPDIR}"
+
+    echo "${BGREEN}==> ${BOLD}Updating and downloading build scripts...${NOATTR}"
+    # go through loop while reading repo list, one by one it will be parsed what's going to be done
+    # repos should contain extension at the end to identify the script what to do about it
+    # git - https://foo.bar/repo.git
+    # zip - https://foo.bar/repo.zip
+    # tar* - https://foo.bar/repo.tar
+    # they shouldn't contain subdirectories otherwise it would treat it as a package
+    # to strip, add strip: uri, e.g.:
+    # strip:https://foo.bar/repo-with-subdirectories.tar (Note that git method would ignore this situation)
+    while IFS=$'\n' read repolists; do
+        SHPKG_TMPDIR="$(mktemp -d -p ${SHPKG_PERSIST_TMPDIR})" # maybe messy but a worthy way to do it :)
+        case "${repolists}" in
+        '#'*)
+            continue
+            ;;
+        *.git)
+            FETCH_METHOD="git"
+            ;;
+        *.zip)
+            FETCH_METHOD="zip"
+            ;;
+        *.tar.xz | *.tar.gz | *.tgz | *.tar | *.txz)
+            FETCH_METHOD="tar"
+            ;;
+        *)
+            echo "${BRED}Error: ${BOLD}unspecified url extension! valid url extensions are (tar.*, git, zip)${NOATTR}"
+            exit 2
+            ;;
+        esac
+
+        # check if they have strip: uri
+        if [ "${FETCH_METHOD}" == "git" ]; then
+            FETCH_CMD="git clone --quiet"
+            STRIP_METHOD="${SHPKG_TMPDIR}"
+            # check for strip: uri, if it specified (cuz of user's curiosity). ignore it and just sed it
+            case "${repolists}" in
+            strip:*.git)
+                SED="y"
+                ;;
+            *)
+                SED=""
+                ;;
+            esac
+        else
+            case "${repolists}" in
+            strip:*)
+                SED="y"
+                if [ "${FETCH_METHOD}" == "tar" ]; then
+                    FETCH_CMD="tar -xf"
+                    STRIP_METHOD="--strip=1 -C ${SHPKG_PKGDIRS}"
+                    MOVE=""
+                else
+                    FETCH_CMD="unzip -qq"
+                    STRIP_METHOD="-d ${SHPKG_TMPDIR}"
+                    MOVE="y"
+                fi
+                ;;
+            *)
+                SED=""
+                if [ "${FETCH_METHOD}" == "tar" ]; then
+                    FETCH_CMD="tar -xf"
+                    STRIP_METHOD="-C ${SHPKG_PKGDIRS}"
+                    MOVE=""
+                else
+                    FETCH_CMD="unzip -qq"
+                    STRIP_METHOD="-d ${SHPKG_PKGDIRS}"
+                    MOVE=""
+                fi
+                ;;
+            esac
+        fi
+
+        # begin fetching
+        if [ "${FETCH_METHOD}" == "git" ]; then
+            # check for sed variable, ignore the strip: uri:
+            if [ -n "${SED}" ]; then
+                eval "${FETCH_CMD} $(echo ${repolists} | sed 's/strip://g') ${SHPKG_TMPDIR}/reporoot"
+            else
+                eval "${FETCH_CMD} ${repolists} ${SHPKG_TMPDIR}/reporoot"
+            fi
+            eval "mv ${SHPKG_TMPDIR}/reporoot/* ${SHPKG_PKGDIRS}/"
+        else
+            if [ -n "${SED}" ]; then
+                curl --location --silent "$(echo ${repolists} | sed 's/strip://g')" --output "${SHPKG_TMPDIR}/output-repo"
+            else
+                curl --location --silent "${repolists}" --output "${SHPKG_TMPDIR}/output-repo"
+            fi
+            # begin package extract
+            eval "${FETCH_CMD} ${SHPKG_TMPDIR}/output-repo ${STRIP_METHOD}"
+            # check if we move things out
+            if [ -n "${MOVE}" ]; then
+                eval "mv ${SHPKG_TMPDIR}/*/* ${SHPKG_PKGDIRS}/"
+            fi
+        fi
+
+        # print out repo url's to indicate it's done updating, sed if possible to trip strip: uri
+        if [ -n "${SED}" ]; then
+            echo "${repolists}... done" | sed 's/strip://g'
+        else
+            echo "${repolists}... done"
+        fi
+
+        # delete tmpdir to clean things up
+        rm -rf ${SHPKG_PERSIST_TMPDIR}/*
+    done <"${SHPKG_REPOLIST}"
+}
+
+shpkg-show-help() {
+    echo "${BOLD}shpkg: the package manager written in bash! (${SHPKG_VERSION})"
+    echo "usage: shpkg [action] package"
+    echo
+    echo "Package build scripts: ${SHPKG_PKGDIRS}"
+    echo
+    echo "Commands:"
+    echo " install          installs a desired package"
+    echo " uninstall        removes a desired package"
+    echo " query            gathers information within a package"
+    echo " list             lists available packages"
+    echo " update           update buildscripts"
+    echo " info | show      show package buildscript information"
+}
+
+# do action
+eval "${SHPKG_ACTION}"
+
+# end of script

@@ -1,0 +1,18 @@
+control:
+    Package: shpkg
+    Version: 1.6.2
+    Architecture: all
+    Installed-Size: 160
+    Maintainer: Yisus7u7 <dev.yisus@hotmail.com>
+    Depends: git, wget, curl, bsdtar
+    Homepage: https://github.com/Yisus7u7/termux-desktop-google-web-apps
+    Description: |-
+        A AUR-like package manager for termux, made in bash
+installation_prefix: /data/data/com.termux/files/usr
+
+data_files:
+    bin/shpkg:
+         source: shpkg
+
+    etc/shpkg_repo.list:
+         source: shpkg_repo.list
